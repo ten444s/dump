@@ -1,0 +1,460 @@
+gui.remove("perpetual dex")
+
+local CONFIG = {
+    BatchSize = 150,
+    IncludeRoot = true,
+    IncludeAttributes = true,
+    IncludeProperties = true,
+    DecompileScripts = true,
+    MaxSourceBytes = 300000,
+    MaxEmbeddedSourceBytes = 12000000,
+}
+
+local ROOT_NAMES = {
+    "game (everything)",
+    "Workspace",
+    "ReplicatedStorage",
+    "ReplicatedFirst",
+    "Players",
+    "Lighting",
+    "StarterGui",
+    "StarterPack",
+    "StarterPlayer",
+    "SoundService",
+    "Chat",
+    "Teams",
+    "TextChatService",
+}
+
+local ATTR_TYPES = {
+    BOOL = 1,
+    INT = 2,
+    FLOAT = 3,
+    DOUBLE = 4,
+    NUMBER = 5,
+    STRING = 6,
+    VECTOR2 = 7,
+    VECTOR3 = 8,
+    COLOR3 = 9,
+}
+
+local selectedIndex = 2
+local running = false
+local lastOutput = ""
+local sourceBudget = 0
+
+local function safe(fn, fallback)
+    local ok, result = pcall(fn)
+    if ok then return result end
+    return fallback
+end
+
+local function valid(inst)
+    return inst and safe(function() return inst:isvalid() end, false)
+end
+
+local function clean_name(value)
+    local s = tostring(value or "unknown")
+    s = s:gsub("[^%w%._%-]+", "_")
+    s = s:gsub("_+", "_")
+    s = s:gsub("^_+", ""):gsub("_+$", "")
+    if s == "" then return "unknown" end
+    return s:sub(1, 90)
+end
+
+local function num(value)
+    if type(value) ~= "number" then return value end
+    if value ~= value then return "NaN" end
+    if value == math.huge then return "Infinity" end
+    if value == -math.huge then return "-Infinity" end
+    return value
+end
+
+local function normalize(value, depth)
+    depth = depth or 0
+    if depth > 3 then return "<max-depth>" end
+    local kind = type(value)
+    if value == nil or kind == "string" or kind == "boolean" then return value end
+    if kind == "number" then return num(value) end
+    if kind == "table" then
+        local x = value.x or value.X
+        local y = value.y or value.Y
+        local z = value.z or value.Z
+        local r = value.r or value.R
+        local g = value.g or value.G
+        local b = value.b or value.B
+        if x ~= nil and y ~= nil and z ~= nil then
+            return { type = "Vector3", x = num(x), y = num(y), z = num(z) }
+        end
+        if x ~= nil and y ~= nil then
+            return { type = "Vector2", x = num(x), y = num(y) }
+        end
+        if r ~= nil and g ~= nil and b ~= nil then
+            return { type = "Color", r = num(r), g = num(g), b = num(b), a = num(value.a or value.A or 1) }
+        end
+        local out, count = {}, 0
+        for k, v in pairs(value) do
+            count = count + 1
+            if count > 256 then
+                out.__truncated = true
+                break
+            end
+            out[tostring(k)] = normalize(v, depth + 1)
+        end
+        return out
+    end
+    if kind == "userdata" then
+        if valid(value) then
+            return {
+                type = "Instance",
+                name = safe(function() return value.name end, "?"),
+                className = safe(function() return value.class_name end, "?"),
+                address = string.format("0x%X", safe(function() return value.identity end, 0)),
+            }
+        end
+        return tostring(value)
+    end
+    return { type = kind, value = tostring(value) }
+end
+
+local function put(props, key, fn)
+    local value = safe(fn, nil)
+    if value ~= nil then props[key] = normalize(value) end
+end
+
+local function identity_hex(inst)
+    local id = valid(inst) and safe(function() return inst.identity end, nil) or nil
+    return type(id) == "number" and string.format("0x%X", id) or (id and tostring(id) or nil)
+end
+
+local function build_path(inst)
+    local names, seen, cur = {}, {}, inst
+    for _ = 1, 256 do
+        if not valid(cur) then break end
+        local id = tostring(safe(function() return cur.identity end, cur))
+        if seen[id] then
+            table.insert(names, 1, "<cycle>")
+            break
+        end
+        seen[id] = true
+        table.insert(names, 1, safe(function() return cur.name end, "?"))
+        cur = safe(function() return cur:get_parent() end, nil)
+    end
+    return table.concat(names, "."), math.max(0, #names - 1)
+end
+
+local function read_attributes(inst)
+    if not CONFIG.IncludeAttributes then return nil end
+    local attrs = safe(function() return inst:get_attributes() end, nil)
+    if type(attrs) ~= "table" then return nil end
+
+    local out = {}
+    for name, attrType in pairs(attrs) do
+        local value = safe(function() return inst:get_attribute(tostring(name), attrType) end, nil)
+        out[tostring(name)] = {
+            attributeType = tostring(attrType),
+            value = normalize(value),
+        }
+    end
+    return next(out) and out or nil
+end
+
+local function is_a(inst, className)
+    return safe(function() return inst:isa(className) end, false)
+end
+
+local function read_properties(inst, className)
+    if not CONFIG.IncludeProperties then return nil end
+    local p = {}
+
+    if is_a(inst, "BasePart") or className == "Part" or className == "MeshPart"
+        or className == "UnionOperation" or className == "WedgePart" then
+        for key, getter in pairs({
+            shape = function() return inst.shape end,
+            position = function() return inst.position end,
+            cframePosition = function() return inst.cframe_position end,
+            cframeAngle = function() return inst.cframe_angle end,
+            lookVector = function() return inst.cframe_lookvector end,
+            rightVector = function() return inst.cframe_rightvector end,
+            upVector = function() return inst.cframe_upvector end,
+            velocity = function() return inst.velocity end,
+            linearVelocity = function() return inst.linear_velocity end,
+            size = function() return inst.size end,
+            collision = function() return inst.collision end,
+            transparency = function() return inst.transparency end,
+            color = function() return inst.color end,
+            material = function() return inst.material end,
+            anchored = function() return inst.anchored end,
+            primitiveAddress = function() return identity_hex(inst:get_primitive()) end,
+        }) do put(p, key, getter) end
+    end
+
+    if className == "Humanoid" then
+        for key, getter in pairs({
+            health = function() return inst.health end,
+            maxHealth = function() return inst.max_health end,
+            rigType = function() return inst:get_rigtype() end,
+            moveDirection = function() return inst.move_direction end,
+            jumpPower = function() return inst.jumppower end,
+            hipHeight = function() return inst.hipheight end,
+            walkSpeed = function() return inst.walkspeed end,
+            sit = function() return inst.sit end,
+            state = function() return inst:get_state() end,
+        }) do put(p, key, getter) end
+    elseif className == "Player" then
+        for key, getter in pairs({
+            displayName = function() return inst.display_name end,
+            userId = function() return inst.userid end,
+            isFriend = function() return inst:is_friend() end,
+            team = function() return inst:get_team() end,
+            character = function() return inst.character end,
+            cameraMinDistance = function() return inst:get_camera_min_dist() end,
+            cameraMaxDistance = function() return inst:get_camera_max_dist() end,
+        }) do put(p, key, getter) end
+    elseif className == "IntValue" then
+        put(p, "value", function() return inst:get_value_int() end)
+    elseif className == "StringValue" then
+        put(p, "value", function() return inst:get_value_string() end)
+    elseif className == "BoolValue" then
+        put(p, "value", function() return inst:get_value_bool() end)
+    elseif className == "NumberValue" then
+        put(p, "value", function() return inst:get_value_double() end)
+    elseif className == "Vector3Value" then
+        put(p, "value", function() return inst:get_value_vector() end)
+    elseif className == "ObjectValue" then
+        put(p, "value", function() return inst:get_value_object() end)
+    elseif className == "Color3Value" then
+        put(p, "value", function() return inst:get_value_color() end)
+    elseif className == "Sound" then
+        put(p, "soundId", function() return inst:get_soundid() end)
+    elseif className == "MeshPart" then
+        put(p, "meshPartId", function() return inst:get_meshpart_id() end)
+        put(p, "meshId", function() return inst:get_meshid() end)
+        put(p, "textureId", function() return inst:get_textureid() end)
+    elseif className == "SpecialMesh" then
+        put(p, "meshId", function() return inst:get_meshid() end)
+        put(p, "textureId", function() return inst:get_textureid() end)
+    elseif className == "Decal" or className == "Texture" or className == "ImageLabel" or className == "ImageButton" then
+        put(p, "texture", function() return inst:get_texture() end)
+        put(p, "imageTransparency", function() return inst.image_transparency end)
+    elseif className == "TextLabel" or className == "TextButton" or className == "TextBox" then
+        put(p, "text", function() return inst:get_label_text() end)
+        put(p, "textColor", function() return inst:get_label_text_color() end)
+        put(p, "backgroundColor", function() return inst:get_label_background_color() end)
+        put(p, "guiPosition", function() return inst.gui_position end)
+        put(p, "guiSize", function() return inst.gui_size end)
+    elseif className == "Camera" then
+        put(p, "position", function() return inst.camera_position end)
+        put(p, "subject", function() return inst.camera_subject end)
+        put(p, "lookVector", function() return inst.camera_lookvector end)
+        put(p, "fieldOfView", function() return inst.fov end)
+    elseif className == "Lighting" then
+        put(p, "fog", function() return inst.fog end)
+        put(p, "exposure", function() return inst.exposure end)
+        put(p, "outdoorAmbient", function() return inst.outdoor_ambient end)
+        put(p, "ambient", function() return inst.ambient end)
+        put(p, "timeOfDay", function() return inst:get_timeof_day() end)
+    elseif className == "ProximityPrompt" then
+        put(p, "holdDuration", function() return inst.hold_duration end)
+    end
+
+    return next(p) and p or nil
+end
+
+local function script_details(inst, className)
+    if className ~= "LocalScript" and className ~= "ModuleScript" and className ~= "Script" then return nil end
+    local details = {}
+    local bytecode = safe(function() return inst:getscriptbytecode() end, nil)
+    if type(bytecode) == "string" then details.bytecodeBytes = #bytecode end
+
+    if CONFIG.DecompileScripts and sourceBudget < CONFIG.MaxEmbeddedSourceBytes then
+        local source = safe(function() return inst:decompile_script() end, nil)
+        if type(source) == "string" and source ~= "" then
+            details.sourceBytes = #source
+            if #source > CONFIG.MaxSourceBytes then
+                source = source:sub(1, CONFIG.MaxSourceBytes) .. "\n--[[ truncated by perpetual dex ]]"
+                details.sourceTruncated = true
+            end
+            local remaining = CONFIG.MaxEmbeddedSourceBytes - sourceBudget
+            if #source > remaining then
+                source = source:sub(1, remaining) .. "\n--[[ total source budget exhausted ]]"
+                details.sourceTruncated = true
+            end
+            sourceBudget = sourceBudget + #source
+            details.source = source
+        else
+            details.sourceError = "decompile_failed"
+        end
+    elseif CONFIG.DecompileScripts then
+        details.sourceError = "total_source_budget_exhausted"
+    end
+    return details
+end
+
+local function resolve_root(index)
+    if index == 0 then return game, "game" end
+    local name = ROOT_NAMES[index + 1]
+    if not name then return game, "game" end
+    return safe(function() return game:get_service(name) end, nil), name
+end
+
+local function format_text(doc)
+    local lines = {
+        "PERPETUAL DEX / PHOTON",
+        "schema: " .. tostring(doc.schema),
+        "game: " .. tostring(doc.meta.gameName),
+        "placeId: " .. tostring(doc.meta.placeId),
+        "gameId: " .. tostring(doc.meta.gameId),
+        "root: " .. tostring(doc.meta.rootName),
+        "captured: " .. tostring(doc.meta.timestamp),
+        "instances: " .. tostring(doc.summary.instanceCount),
+        "errors: " .. tostring(doc.summary.errorCount),
+        "",
+        "INDEX | PARENT | ADDRESS | CLASS | PATH",
+    }
+    for _, e in ipairs(doc.entries) do
+        lines[#lines + 1] = string.format(
+            "%d | %s | %s | %s | %s",
+            e.index,
+            tostring(e.parentIndex or "-"),
+            tostring(e.address or "-"),
+            tostring(e.className),
+            tostring(e.path)
+        )
+        if e.attributes then lines[#lines + 1] = "  attributes=" .. table_to_JSON(e.attributes) end
+        if e.properties then lines[#lines + 1] = "  properties=" .. table_to_JSON(e.properties) end
+        if e.script then
+            local copy = {}
+            for key, value in pairs(e.script) do
+                if key ~= "source" then copy[key] = value end
+            end
+            lines[#lines + 1] = "  script=" .. table_to_JSON(copy)
+        end
+    end
+    return table.concat(lines, "\n")
+end
+
+local status
+
+local function run_dump()
+    if running then
+        log.add("[perpetual dex] dump already running", color(1, 1, 0, 1))
+        return
+    end
+    running = true
+    sourceBudget = 0
+
+    local root, rootName = resolve_root(selectedIndex)
+    if not valid(root) then
+        running = false
+        log.add("[perpetual dex] selected root unavailable", color(1, 0, 0, 1))
+        return
+    end
+
+    local timestamp = os.date("%Y-%m-%d_%H-%M-%S")
+    local gameName = safe(function() return game.name end, "game")
+    local placeId = safe(get_placeid, "?")
+    local gameId = safe(get_gameid, "?")
+    local objects = {}
+    if CONFIG.IncludeRoot then objects[#objects + 1] = root end
+    local descendants = safe(function() return root:get_descendants() end, {})
+    for _, inst in pairs(descendants) do objects[#objects + 1] = inst end
+
+    local entries, indexById, classCounts, errors = {}, {}, {}, {}
+    if status then status:set_label("Scanning 0 / " .. tostring(#objects)) end
+
+    for i, inst in ipairs(objects) do
+        local ok, err = pcall(function()
+            local id = safe(function() return inst.identity end, nil)
+            local parent = safe(function() return inst:get_parent() end, nil)
+            local parentId = valid(parent) and safe(function() return parent.identity end, nil) or nil
+            local className = safe(function() return inst.class_name end, "?")
+            local path, depth = build_path(inst)
+            local entry = {
+                index = #entries + 1,
+                parentIndex = parentId and indexById[tostring(parentId)] or nil,
+                parentAddress = identity_hex(parent),
+                address = identity_hex(inst),
+                name = safe(function() return inst.name end, "?"),
+                className = className,
+                path = path,
+                depth = depth,
+                childCount = #(safe(function() return inst:get_children() end, {})),
+                attributes = read_attributes(inst),
+                properties = read_properties(inst, className),
+                script = script_details(inst, className),
+            }
+            entries[#entries + 1] = entry
+            if id then indexById[tostring(id)] = entry.index end
+            classCounts[className] = (classCounts[className] or 0) + 1
+        end)
+        if not ok then errors[#errors + 1] = { scanIndex = i, error = tostring(err) } end
+
+        if i % CONFIG.BatchSize == 0 then
+            if status then status:set_label("Scanning " .. tostring(i) .. " / " .. tostring(#objects)) end
+            wait()
+        end
+    end
+
+    local doc = {
+        schema = "perpetual-dex-v1",
+        runtime = "Photon",
+        meta = {
+            gameName = gameName,
+            placeId = placeId,
+            gameId = gameId,
+            timestamp = timestamp,
+            rootName = rootName,
+            rootAddress = identity_hex(root),
+        },
+        options = CONFIG,
+        summary = {
+            instanceCount = #entries,
+            errorCount = #errors,
+            embeddedSourceBytes = sourceBudget,
+            classCounts = classCounts,
+        },
+        errors = errors,
+        entries = entries,
+    }
+
+    local stem = "perpetual_dex_photon_" .. clean_name(gameName) .. "_" .. tostring(placeId)
+        .. "_" .. clean_name(rootName) .. "_" .. timestamp
+    local jsonPath = stem .. ".json"
+    local textPath = stem .. ".txt"
+    local json = safe(function() return table_to_JSON(doc) end, nil)
+    if json then file.overwrite(jsonPath, json) end
+    file.overwrite(textPath, format_text(doc))
+    lastOutput = jsonPath
+    input.set_clipboard(jsonPath)
+
+    if status then
+        status:set_label(string.format("Complete: %d instances / %d errors", #entries, #errors))
+    end
+    log.add("[perpetual dex] " .. jsonPath, color(0, 1, 1, 1))
+    running = false
+end
+
+local menu = gui.create("perpetual dex", false)
+menu:set_size(430, 390)
+menu:add_label("--- Perpetual DEX / Photon ---")
+menu:add_label("Maximum-detail, read-only hierarchy dump")
+local rootCombo = menu:add_combo("Root", ROOT_NAMES, selectedIndex)
+rootCombo:change_callback(function()
+    selectedIndex = rootCombo:get_value()
+end)
+local batchSlider = menu:add_slider("Batch Size", 50, 1000, CONFIG.BatchSize)
+batchSlider:change_callback(function()
+    CONFIG.BatchSize = batchSlider:get_value()
+end)
+local sourceCheck = menu:add_checkbox("Embed Decompiled Scripts", CONFIG.DecompileScripts)
+sourceCheck:change_callback(function()
+    CONFIG.DecompileScripts = sourceCheck:get_value()
+end)
+menu:add_button("Dump JSON + TXT", function() spawn(run_dump) end)
+menu:add_button("Copy Last Output Path", function()
+    if lastOutput ~= "" then input.set_clipboard(lastOutput) end
+end)
+status = menu:add_label("Ready")
+menu:add_label("Output: Photon data folder")
+menu:add_label("Filename includes game, place, root, and date")
